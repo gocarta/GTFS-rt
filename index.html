@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GTFS Realtime Maplibre Visualizer</title>
+    
+    <link href="https://unpkg.com/maplibre-gl@4.1.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <script src="https://unpkg.com/maplibre-gl@4.1.2/dist/maplibre-gl.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/protobufjs@7.2.6/dist/protobuf.min.js"></script>
+
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+        #loading-panel {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(255, 255, 255, 0.9); padding: 15px;
+            border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+            z-index: 1; max-width: 320px;
+        }
+        .status { font-weight: bold; color: #333; }
+        .spinner {
+            display: inline-block; width: 12px; height: 12px;
+            border: 2px solid #ccc; border-top-color: #333;
+            border-radius: 50%; animation: spin 1s linear infinite;
+            margin-right: 5px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .popup-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 5px; }
+        .popup-table th, .popup-table td { padding: 4px; text-align: left; border-bottom: 1px solid #ddd; }
+        .popup-table th { background: #f4f4f4; }
+    </style>
+</head>
+<body>
+
+<div id="loading-panel">
+    <h3>Carta Transit Monitor</h3>
+    <div id="status-message"><span class="spinner"></span>Initializing map...</div>
+</div>
+<div id="map"></div>
+
+<script>
+    // --- Configuration URLs ---
+    const STATIC_GTFS_URL = 'https://raw.githubusercontent.com/gocarta/gtfs/refs/heads/master/gtfs_current.zip';
+    const VEHICLE_POSITIONS_URL = 'https://gocarta.s3.us-east-2.amazonaws.com/public/gtfs-rt/VehiclePositions.pb';
+    const TRIP_UPDATES_URL = 'https://gocarta.s3.us-east-2.amazonaws.com/public/gtfs-rt/TripUpdates.pb';
+
+    // Expanded Proto definition file representing GTFS Realtime to handle positions AND trip updates
+    const protoDef = `
+        package transit_realtime;
+        message FeedMessage {
+            required FeedHeader header = 1;
+            repeated FeedEntity entity = 2;
+        }
+        message FeedHeader {
+            required string gtfs_realtime_version = 1;
+            optional Incrementality incrementality = 2 [default = FULL_DATASET];
+            required uint64 timestamp = 3;
+            enum Incrementality { FULL_DATASET = 0; DIFFERENTIAL = 1; }
+        }
+        message FeedEntity {
+            required string id = 1;
+            optional bool is_deleted = 2 [default = false];
+            optional VehiclePosition vehicle = 4;
+            optional TripUpdate trip_update = 3;
+        }
+        message VehiclePosition {
+            optional TripDescriptor trip = 1;
+            optional Position position = 2;
+            optional VehicleDescriptor vehicle = 8;
+        }
+        message TripUpdate {
+            optional TripDescriptor trip = 1;
+            repeated StopTimeUpdate stop_time_update = 2;
+        }
+        message StopTimeUpdate {
+            optional uint32 stop_sequence = 1;
+            optional string stop_id = 4;
+            optional StopTimeEvent arrival = 2;
+            optional StopTimeEvent departure = 3;
+        }
+        message StopTimeEvent {
+            optional int32 delay = 1;
+            optional int64 time = 2;
+            optional int32 uncertainty = 3;
+        }
+        message TripDescriptor {
+            optional string trip_id = 1;
+            optional string route_id = 5;
+        }
+        message Position {
+            required float latitude = 1;
+            required float longitude = 2;
+            optional float bearing = 3;
+        }
+        message VehicleDescriptor {
+            optional string id = 1;
+            optional string label = 2;
+        }
+    `;
+
+    var mapOptions = {
+        container: 'map',
+        style: "https://api.maptiler.com/maps/streets-v2-light/style.json?key=mYniYTe7rfEM5jAFdfKy",
+        center: [-85.310947, 35.055666],
+        zoom: 11
+    };
+
+    const map = new maplibregl.Map(mapOptions);
+
+    // Context storage objects
+    let gtfsData = { routes: {}, trips: {}, shapes: {}, stops: {} };
+    let livePredictions = {}; // Maps trip_id -> { stop_id -> predictedTime }
+    let FeedMessageRoot;
+
+    function updateStatus(text) {
+        document.getElementById('status-message').innerHTML = text;
+    }
+
+    // --- Step 1: Compiling Protobuf Definition ---
+    function initProtobuf() {
+        const jsonDef = protobuf.parse(protoDef).root;
+        FeedMessageRoot = jsonDef.lookupType("transit_realtime.FeedMessage");
+    }
+
+    // --- Step 2: Fetch and Extract Static GTFS Zip ---
+    async function loadStaticGTFS() {
+        updateStatus('<span class="spinner"></span>Downloading Static GTFS...');
+        try {
+            const response = await fetch(STATIC_GTFS_URL);
+            if (!response.ok) throw new Error("Could not download static GTFS.");
+            const buffer = await response.arrayBuffer();
+            
+            updateStatus('<span class="spinner"></span>Unzipping files...');
+            const unzipped = fflate.unzipSync(new Uint8Array(buffer));
+
+            updateStatus('<span class="spinner"></span>Parsing Transit Lines & Stops...');
+            
+            // Parse routes.txt
+            if (unzipped['routes.txt']) {
+                const routesTxt = fflate.strFromU8(unzipped['routes.txt']);
+                Papa.parse(routesTxt, {
+                    header: true,
+                    step: (results) => {
+                        const r = results.data;
+                        if (r.route_id) {
+                            gtfsData.routes[r.route_id] = {
+                                short_name: r.route_short_name || '',
+                                long_name: r.route_long_name || '',
+                                color: r.route_color ? `#${r.route_color}` : '#3388ff'
+                            };
+                        }
+                    }
+                });
+            }
+
+            // Parse trips.txt
+            if (unzipped['trips.txt']) {
+                const tripsTxt = fflate.strFromU8(unzipped['trips.txt']);
+                Papa.parse(tripsTxt, {
+                    header: true,
+                    step: (results) => {
+                        const t = results.data;
+                        if (t.trip_id) {
+                            gtfsData.trips[t.trip_id] = { route_id: t.route_id, shape_id: t.shape_id };
+                        }
+                    }
+                });
+            }
+
+            // Parse stops.txt
+            if (unzipped['stops.txt']) {
+                const stopsTxt = fflate.strFromU8(unzipped['stops.txt']);
+                const stopFeatures = [];
+                Papa.parse(stopsTxt, {
+                    header: true,
+                    step: (results) => {
+                        const s = results.data;
+                        if (s.stop_id && s.stop_lat && s.stop_lon) {
+                            const lat = parseFloat(s.stop_lat);
+                            const lon = parseFloat(s.stop_lon);
+                            
+                            gtfsData.stops[s.stop_id] = {
+                                name: s.stop_name,
+                                lat: lat,
+                                lon: lon
+                            };
+
+                            stopFeatures.push({
+                                "type": "Feature",
+                                "geometry": { "type": "Point", "coordinates": [lon, lat] },
+                                "properties": { "stop_id": s.stop_id, "stop_name": s.stop_name }
+                            });
+                        }
+                    },
+                    complete: () => {
+                        gtfsData.stopsGeoJSON = { "type": "FeatureCollection", "features": stopFeatures };
+                    }
+                });
+            }
+
+            // Parse shapes.txt
+            if (unzipped['shapes.txt']) {
+                const shapesTxt = fflate.strFromU8(unzipped['shapes.txt']);
+                let rawShapes = {};
+                Papa.parse(shapesTxt, {
+                    header: true,
+                    step: (results) => {
+                        const s = results.data;
+                        if (s.shape_id) {
+                            if (!rawShapes[s.shape_id]) rawShapes[s.shape_id] = [];
+                            rawShapes[s.shape_id].push({
+                                seq: parseInt(s.shape_pt_sequence),
+                                lon: parseFloat(s.shape_pt_lon),
+                                lat: parseFloat(s.shape_pt_lat)
+                            });
+                        }
+                    },
+                    complete: () => {
+                        const features = [];
+                        for (const shapeId in rawShapes) {
+                            rawShapes[shapeId].sort((a,b) => a.seq - b.seq);
+                            const coordinates = rawShapes[shapeId].map(pt => [pt.lon, pt.lat]);
+                            features.push({
+                                "type": "Feature",
+                                "properties": { "shape_id": shapeId },
+                                "geometry": { "type": "LineString", "coordinates": coordinates }
+                            });
+                        }
+                        gtfsData.shapesGeoJSON = { "type": "FeatureCollection", "features": features };
+                    }
+                });
+            }
+            updateStatus('Static data processed. Syncing live updates...');
+        } catch (err) {
+            console.error(err);
+            updateStatus('<span style="color:red;">Error processing GTFS data. See browser console.</span>');
+        }
+    }
+
+    // --- Step 3: Fetch Trip Updates (Delays/Predicted Times) ---
+    async function updateTripUpdatesFeed() {
+        try {
+            const res = await fetch(TRIP_UPDATES_URL);
+            if (!res.ok) throw new Error("Failed to pull Trip Updates");
+            const buffer = await res.arrayBuffer();
+            const message = FeedMessageRoot.decode(new Uint8Array(buffer));
+            const object = FeedMessageRoot.toObject(message, { longs: Number, enums: String, defaults: true });
+
+            livePredictions = {}; // Wipe old storage layer
+
+            if (object.entity) {
+                object.entity.forEach(entity => {
+                    console.log("Total trips with live updates:", Object.keys(livePredictions).length);
+
+                    // Let's log a couple of the exact stop IDs that CARTA IS tracking right now:
+                    const sampleTrip = Object.keys(livePredictions)[0];
+                    if (sampleTrip) {
+                        console.log("Sample Trip ID:", sampleTrip);
+                        console.log("Tracked Stop IDs on this trip:", livePredictions[sampleTrip].map(u => u.stop_id));
+                    }
+                    if (entity.tripUpdate && entity.tripUpdate.stopTimeUpdate) {
+                        const tu = entity.tripUpdate;
+                        const tripId = tu.trip.tripId;
+                        console.log({tu});
+                        livePredictions[tripId] = [];
+
+                        tu.stopTimeUpdate.forEach(stu => {
+                            if (stu.stopId && stu.arrival && stu.arrival.time) {
+                                livePredictions[tripId].push({
+                                    stop_id: stu.stopId,
+                                    arrival_time: stu.arrival.time * 1000 // Convert seconds to JS Epoch Milliseconds
+                                });
+                            }
+                        });
+                    }
+                });
+            }
+        } catch (e) {
+            console.error("Error updates on Trip updates feed:", e);
+        }
+    }
+
+    // --- Step 4: Fetch and Render GTFS Realtime Vehicle Positions ---
+    async function updateRealtimeFeed() {
+        try {
+            // Simultaneously fetch trip data along with vehicle configurations
+            await updateTripUpdatesFeed();
+
+            const res = await fetch(VEHICLE_POSITIONS_URL);
+            if (!res.ok) throw new Error("Failed to pull Realtime Feed");
+            const buffer = await res.arrayBuffer();
+            const message = FeedMessageRoot.decode(new Uint8Array(buffer));
+            const object = FeedMessageRoot.toObject(message, { longs: Number, enums: String, defaults: true });
+
+            const vehicleFeatures = [];
+
+            if (object.entity) {
+                object.entity.forEach(entity => {
+                    if (entity.vehicle && entity.vehicle.position) {
+                        const v = entity.vehicle;
+                        const tripId = v.trip ? v.trip.trip_id : null;
+                        let routeId = v.trip ? v.trip.route_id : null;
+                        
+                        if (!routeId && tripId && gtfsData.trips[tripId]) {
+                            routeId = gtfsData.trips[tripId].route_id;
+                        }
+
+                        const routeInfo = gtfsData.routes[routeId] || { short_name: "Bus", color: "#FF5733" };
+
+                        vehicleFeatures.push({
+                            "type": "Feature",
+                            "geometry": {
+                                "type": "Point",
+                                "coordinates": [v.position.longitude, v.position.latitude]
+                            },
+                            "properties": {
+                                "vehicle_id": v.vehicle && v.vehicle.vehicle ? (v.vehicle.vehicle.id || "N/A") : "N/A",
+                                "trip_id": tripId || "",
+                                "route_name": routeInfo.short_name,
+                                "route_color": routeInfo.color
+                            }
+                        });
+                    }
+                });
+            }
+
+            const liveGeoJSON = { "type": "FeatureCollection", "features": vehicleFeatures };
+
+            if (map.getSource('vehicles')) {
+                map.getSource('vehicles').setData(liveGeoJSON);
+            } else {
+                map.addSource('vehicles', { type: 'geojson', data: liveGeoJSON });
+                
+                map.addLayer({
+                    id: 'vehicle-layer',
+                    type: 'circle',
+                    source: 'vehicles',
+                    paint: {
+                        'circle-radius': 10,
+                        'circle-color': ['get', 'route_color'],
+                        'circle-stroke-width': 2,
+                        'circle-stroke-color': '#ffffff'
+                    }
+                });
+
+                map.addLayer({
+                    id: 'vehicle-labels',
+                    type: 'symbol',
+                    source: 'vehicles',
+                    layout: {
+                        'text-field': ['get', 'route_name'],
+                        'text-size': 10,
+                        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold']
+                    },
+                    paint: { 'text-color': '#ffffff' }
+                });
+
+                // Vehicle click popup handler
+                map.on('click', 'vehicle-layer', (e) => {
+                    const props = e.features[0].properties;
+                    new maplibregl.Popup()
+                        .setLngLat(e.features[0].geometry.coordinates)
+                        .setHTML(`<strong>Route:</strong> ${props.route_name}<br><strong>Vehicle ID:</strong> ${props.vehicle_id}<br><strong>Trip:</strong> ${props.trip_id}`)
+                        .addTo(map);
+                });
+            }
+            
+            updateStatus('🟢 Operational. Live updates syncing...');
+        } catch (e) {
+            console.error("Error updates:", e);
+        }
+    }
+
+    // --- Execution Pipeline ---
+    map.on('load', async () => {
+        initProtobuf();
+        await loadStaticGTFS();
+
+        // 1. Add static shape lines layer
+        if (gtfsData.shapesGeoJSON) {
+            map.addSource('routes-static', { type: 'geojson', data: gtfsData.shapesGeoJSON });
+            map.addLayer({
+                id: 'static-lines',
+                type: 'line',
+                source: 'routes-static',
+                paint: { 'line-color': '#555555', 'line-width': 1.5, 'line-opacity': 0.3 }
+            });
+        }
+
+        // 2. Add static stops layer
+        if (gtfsData.stopsGeoJSON) {
+            map.addSource('stops-static', { type: 'geojson', data: gtfsData.stopsGeoJSON });
+            map.addLayer({
+                id: 'static-stops-layer',
+                type: 'circle',
+                source: 'stops-static',
+                paint: {
+                    'circle-radius': 4,
+                    'circle-color': '#ffffff',
+                    'circle-stroke-width': 1.5,
+                    'circle-stroke-color': '#333333'
+                }
+            });
+
+// Stop click popup handler (Using PURE TripUpdates.pb data)
+            map.on('click', 'static-stops-layer', (e) => {
+                const stopId = e.features[0].properties.stop_id;
+                const stopName = e.features[0].properties.stop_name;
+                
+                let incomingBuses = [];
+
+                // Iterate through ALL live trip updates to find matching stop IDs
+                for (const tripId in livePredictions) {
+                    // Look for our specific stop inside this trip's update array
+                    const matchingStopUpdate = livePredictions[tripId].find(u => u.stop_id === stopId);
+                    
+                    if (matchingStopUpdate) {
+                        // Find the route_id from static trips data
+                        const staticTrip = gtfsData.trips[tripId];
+                        const routeId = staticTrip ? staticTrip.route_id : null;
+                        
+                        // Find the human-readable route name
+                        const routeInfo = gtfsData.routes[routeId] || { short_name: "Bus" };
+
+                        incomingBuses.push({
+                            route: routeInfo.short_name,
+                            time: matchingStopUpdate.arrival_time
+                        });
+                    }
+                }
+
+                // Sort upcoming predictions so the next arriving bus is at the top
+                incomingBuses.sort((a, b) => a.time - b.time);
+
+                // Build HTML Table representation
+                let rowsHtml = '';
+                if (incomingBuses.length > 0) {
+                    incomingBuses.forEach(bus => {
+                        const dateStr = new Date(bus.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                        rowsHtml += `<tr><td><b>${bus.route}</b></td><td>${dateStr}</td></tr>`;
+                    });
+                } else {
+                    rowsHtml = `<tr><td colspan="2" style="color:#777; text-align:center;">No upcoming arrival predictions.</td></tr>`;
+                }
+
+                const popupContent = `
+                    <div style="min-width:220px;">
+                        <strong>${stopName}</strong><br/>
+                        <small style="color:#666;">ID: ${stopId}</small>
+                        <table class="popup-table">
+                            <thead><tr><th>Route</th><th>ETA</th></tr></thead>
+                            <tbody>${rowsHtml}</tbody>
+                        </table>
+                    </div>
+                `;
+
+                new maplibregl.Popup()
+                    .setLngLat(e.features[0].geometry.coordinates)
+                    .setHTML(popupContent)
+                    .addTo(map);
+            });
+
+            // Adjust cursor style changes over interactive components
+            map.on('mouseenter', 'static-stops-layer', () => map.getCanvas().style.cursor = 'pointer');
+            map.on('mouseleave', 'static-stops-layer', () => map.getCanvas().style.cursor = '');
+            map.on('mouseenter', 'vehicle-layer', () => map.getCanvas().style.cursor = 'pointer');
+            map.on('mouseleave', 'vehicle-layer', () => map.getCanvas().style.cursor = '');
+        }
+
+        // Initialize and poll layout updates
+        updateRealtimeFeed();
+        setInterval(updateRealtimeFeed, 15000); // Poll feed loops every 15 seconds to stay balanced
+    });
+</script>
+
+</body>
+</html>

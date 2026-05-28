@@ -254,18 +254,9 @@
 
             if (object.entity) {
                 object.entity.forEach(entity => {
-                    console.log("Total trips with live updates:", Object.keys(livePredictions).length);
-
-                    // Let's log a couple of the exact stop IDs that CARTA IS tracking right now:
-                    const sampleTrip = Object.keys(livePredictions)[0];
-                    if (sampleTrip) {
-                        console.log("Sample Trip ID:", sampleTrip);
-                        console.log("Tracked Stop IDs on this trip:", livePredictions[sampleTrip].map(u => u.stop_id));
-                    }
                     if (entity.tripUpdate && entity.tripUpdate.stopTimeUpdate) {
                         const tu = entity.tripUpdate;
                         const tripId = tu.trip.tripId;
-                        console.log({tu});
                         livePredictions[tripId] = [];
 
                         tu.stopTimeUpdate.forEach(stu => {

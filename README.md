@@ -9,5 +9,5 @@ GTFS Realtime
 - https://gocarta.github.io/GTFS-rt/
 
 ## source code repos
-- https://github.com/gocarta/gtfs-rt-trip-updates  
-- https://github.com/gocarta/gtfs-rt-vehicle-positions
+- https://github.com/gocarta/dataops-gtfs-rt-trip-updates  
+- https://github.com/gocarta/dataops-gtfs-rt-vehicle-positions
